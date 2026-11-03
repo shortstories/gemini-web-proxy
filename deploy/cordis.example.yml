@@ -1,0 +1,29 @@
+# Merge the provider into the existing llm-pi-ai providers dictionary.
+- id: llm-pi-ai
+  config:
+    providers:
+      gemini-web:
+        displayName: Gemini Web (Google AI subscription)
+        api: openai-completions
+        apiKeyEnv: GEMINI_WEB_PROXY_TOKEN
+        baseURL: http://127.0.0.1:18089/v1
+        timeoutMs: 660000
+        streamIdleTimeoutMs: 660000
+        compat:
+          supportsDeveloperRole: false
+          supportsUsageInStreaming: false
+          maxTokensField: max_tokens
+        models:
+          - id: gemini-web
+            name: Gemini Web · currently selected mode
+            contextWindow: 32768
+            maxTokens: 8192
+            input: [text]
+            reasoningEfforts: false
+
+# After separately installing DevViking-Persike/dsh-subscriptions, this enables
+# its Codex route only. Actual OAuth credentials are created through its flow.
+- id: dsh-subscriptions
+  config:
+    routes: [codex]
+    codexCredentialPath: /home/shortstories/workspace/dsh/data/subscriptions/codex-oauth.json

@@ -1,3 +1,10 @@
+# DSH integration fork
+
+This fork adds in-app Codex and Gemini subscription login for DeepSeek Harness.
+See [DSH.md](DSH.md) for setup, login flow, tests, and bridge limitations.
+
+---
+
 # Gemini Web Proxy for OpenCode
 
 A free Gemini web interface proxy that works as an OpenAI-compatible API for OpenCode. This project allows you to use your free Gemini web subscription as a local API provider with full tool calling support.

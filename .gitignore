@@ -48,8 +48,8 @@ chrome-profile/
 Thumbs.db
 
 # Testing
-test_*.py
-*_test.py
+
+
 testing/
 
 # Temporary files
@@ -58,7 +58,7 @@ testing/
 
 # Playwright
 node_modules/
-/tests
+
 /test-results/
 /playwright-report/
 /blob-report/
@@ -68,4 +68,11 @@ playwright.config.js
 
 # Packages
 package-lock.json
-package.json
+
+# DSH credentials and runtime state are always external to this checkout.
+.env
+*.token
+*.pem
+cookies*
+storage-state*.json
+.venv/

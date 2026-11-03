@@ -1,0 +1,37 @@
+{
+  "name": "dsh-subscription-login",
+  "version": "0.1.0",
+  "description": "Codex와 Gemini 구독 로그인 및 연결 상태",
+  "main": "dsh/host.cjs",
+  "exports": {
+    ".": "./dsh/host.cjs",
+    "./client": "./dsh/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh/**",
+    "server.py",
+    "requirements.txt",
+    "run.py",
+    "deploy/**",
+    "README.md",
+    "LICENSE",
+    "DSH.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shortstories/gemini-web-proxy.git"
+  }
+}
