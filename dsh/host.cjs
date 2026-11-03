@@ -38,6 +38,25 @@ function createHandler(deps = {}) {
   const codexStatus = deps.codexStatus || (() => jsonFetch('http://127.0.0.1:1458/codex/status'));
   let pendingCodexUrl;
   const state = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'integrations/gemini-web');
+  const bridge = async (path, method = 'GET') => {
+    const token = (await readFile(join(state, 'proxy.token'), 'utf8')).trim();
+    const response = await localFetch('http://127.0.0.1:18089' + path, {
+      method, headers: {authorization: 'Bearer ' + token}, signal: AbortSignal.timeout(45000),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Gemini 웹 모델 목록을 가져오지 못했습니다.');
+    return data;
+  };
+  const refreshModels = async () => {
+    const catalog = await bridge('/v1/models');
+    if (!Array.isArray(catalog.data) || !catalog.data.length || catalog.data.length > 32
+        || catalog.data.some(m => typeof m.id !== 'string' || !/^gemini-web(?:-[a-z0-9-]+)?$/.test(m.id) || typeof m.name !== 'string')) {
+      throw new Error('Gemini 웹 모델 목록 형식이 올바르지 않습니다.');
+    }
+    if (!deps.syncModels) throw new Error('dsh 모델 설정 서비스가 준비되지 않았습니다.');
+    await deps.syncModels(catalog.data);
+    return catalog.data;
+  };
   const service = deps.service || (async () => {
     await mkdir(state, {recursive: true, mode: 0o700});
     await unlink(join(state, 'login-complete')).catch(error => {if (error.code !== 'ENOENT') throw error;});
@@ -109,26 +128,44 @@ function createHandler(deps = {}) {
         await service(); reply(200, {url: '/subscription-browser/vnc.html?autoconnect=true&resize=scale&path=subscription-browser/websockify'}); return;
       }
       if (path === ROOT + '/gemini/complete') {
-        const token = (await readFile(join(state, 'proxy.token'), 'utf8')).trim();
-        const response = await localFetch('http://127.0.0.1:18089/login/complete', {
-          method: 'POST', headers: {authorization: 'Bearer ' + token}, signal: AbortSignal.timeout(5000),
-        });
-        if (!response.ok) throw new Error('먼저 Google 계정으로 로그인해 주세요.');
-        reply(200, {submitted: true}); return;
+        const current = await jsonFetch('http://127.0.0.1:18089/health');
+        if (current.status !== 'ready') {
+          await bridge('/login/complete', 'POST');
+          const deadline = Date.now() + 30000;
+          let ready = false;
+          while (Date.now() < deadline) {
+            const health = await jsonFetch('http://127.0.0.1:18089/health');
+            if (health.status === 'ready') {ready = true; break;}
+            if (['verification-failed', 'window-closed', 'error'].includes(health.stage)) throw new Error(health.error || 'Google 로그인을 확인하지 못했습니다.');
+            await new Promise(resolve => setTimeout(resolve, 400));
+          }
+          if (!ready) throw new Error('Google 로그인 확인 시간이 초과됐습니다. 상태를 확인한 뒤 다시 시도해 주세요.');
+        }
+        const models = await refreshModels();
+        reply(200, {connected: true, models}); return;
+      }
+      if (path === ROOT + '/gemini/models/refresh') {
+        reply(200, {models: await refreshModels()}); return;
       }
       reply(404, {error: 'Not found'});
     } catch (error) {
       // Do not echo callback URLs, authorization codes, or upstream bodies.
-      const safe = /인증|입력|진행 중|로그인/.test(error.message) ? error.message : '연결하지 못했습니다. 잠시 후 다시 시도해 주세요.';
+      const safe = /인증|입력|진행 중|로그인|모델/.test(error.message) ? error.message : '연결하지 못했습니다. 잠시 후 다시 시도해 주세요.';
       reply(400, {error: safe});
     }
   };
 }
 
 exports.name = 'subscription-login';
-exports.inject = ['webServer'];
+exports.inject = ['webServer', 'settings'];
 exports.apply = (ctx) => ctx.effect(() => ctx.webServer.register({
-  kind: 'prefix', path: ROOT, handler: createHandler(),
+  kind: 'prefix', path: ROOT, handler: createHandler({syncModels: async models => {
+    const descriptor = ctx.settings.describe({redactSecrets: true}).find(entry => entry.ns === 'llm-pi-ai');
+    if (!descriptor?.value?.providers?.['gemini-web']) throw new Error('Gemini 웹 모델 공급자 설정을 먼저 추가해 주세요.');
+    await ctx.settings.mutate('llm-pi-ai', [{op: 'set', path: ['providers', 'gemini-web', 'models'], value: models.map(model => ({
+      id: model.id, name: model.name, contextWindow: 32768, maxTokens: 8192, input: ['text'], reasoningEfforts: false,
+    }))}], descriptor.revision);
+  }}),
 }), 'subscription login pages');
 exports.callbackPath = callbackPath;
 exports.createHandler = createHandler;

@@ -30,6 +30,19 @@ also includes the panel. A direct link is `/subscription-login/`.
 Both panels show current connection status. Model inference has not been
 verified until a real account login and model request succeed.
 
+After connecting Gemini, the panel reads the account's actual model menu and
+updates the existing DSH `gemini-web` provider through DSH's Settings service.
+**웹 모델 목록 새로고침** repeats discovery without a DSH restart. Only enabled
+model entries are included; thinking-depth controls are not models. DSH shows
+the menu's labels, and request ids use the web menu's stable mode identities.
+Choosing one in DSH selects and verifies that mode in the browser before
+sending the request. A removed/unavailable mode fails explicitly.
+
+The background browser uses the same operating-system credential store as
+ordinary Chrome. Playwright's default `--password-store=basic` override is
+disabled so it can decrypt the manual login's cookies. A failed session check
+reports an error and stops; it never automatically cycles through login windows.
+
 ## Host deployment
 
 The files in `deploy/` are templates for the current shortstories host. Adjust
@@ -68,7 +81,10 @@ cannot share browser context. Gemini Web may retain the created chats in the
 account's own activity history.
 
 The model id `gemini-web` denotes the web application's currently selected
-mode; it does not promise a particular backend model. Input is text only.
+mode; it does not promise a particular backend model. Discovered
+`gemini-web-<web-mode-id>` ids explicitly select their corresponding menu entry.
+The visible mode labels come from the account rather than a hard-coded model
+catalog. Input is text only.
 Tool calls use JSON generated from the supplied definitions, with declared
 names and object arguments checked before dispatch. This is experimental and
 does not offer native function-calling guarantees. Browser UI changes can

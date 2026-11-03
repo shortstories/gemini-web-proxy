@@ -10,6 +10,7 @@ import os
 import uuid
 import hmac
 import shutil
+import hashlib
 from pathlib import Path
 from playwright.async_api import async_playwright, BrowserContext, Page
 from markdownify import markdownify as md
@@ -34,7 +35,9 @@ request_lock = asyncio.Lock()
 startup_task = None
 manual_browser = None
 login_stage = "starting"
+login_error = None
 MODEL_ID = "gemini-web"
+model_choices = {}
 
 @app.middleware("http")
 async def local_auth(request, call_next):
@@ -67,7 +70,7 @@ class Tool(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: Optional[str] = "gemini-web"
+    model: str = "gemini-web"
     messages: List[Message]
     stream: Optional[bool] = False
     timeout: Optional[int] = None
@@ -99,7 +102,7 @@ async def check_logged_in(page: Page) -> bool:
 
 
 async def init_browser():
-    global context, playwright_instance, is_ready, manual_browser, login_stage
+    global context, playwright_instance, is_ready, manual_browser, login_stage, login_error
     SERVICE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     playwright_instance = await async_playwright().start()
     while True:
@@ -136,6 +139,7 @@ async def init_browser():
             LOGIN_COMPLETE.unlink(missing_ok=True)
         context = await playwright_instance.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR), headless=True, channel="chrome",
+            ignore_default_args=["--password-store=basic", "--use-mock-keychain"],
             args=["--disable-extensions", "--no-first-run", "--disable-dev-shm-usage"],
             viewport={"width": 1280, "height": 900},
         )
@@ -146,13 +150,91 @@ async def init_browser():
             LOGIN_FLAG.unlink(missing_ok=True)
             await context.close()
             context = None
-            continue
+            login_stage = "verification-failed"
+            login_error = "저장된 Google 로그인을 확인하지 못했습니다. 자동 재로그인은 중지했습니다."
+            return
         LOGIN_FLAG.write_text("ok")
         await page.close()
         is_ready = True
         login_stage = "connected"
         print("Gemini web subscription is ready (headless).", flush=True)
         return
+
+
+def mode_id(label, web_id=None):
+    if web_id and re.fullmatch(r"[a-zA-Z0-9-]+", web_id):
+        return "gemini-web-" + web_id.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    return "gemini-web-" + (slug or hashlib.sha256(label.encode()).hexdigest()[:10])
+
+
+async def mode_items(page):
+    trigger = page.locator('.model-picker-container button').first
+    await trigger.wait_for(timeout=20000)
+    await trigger.click()
+    await page.wait_for_timeout(400)
+    for selector in ['[data-mode-id]', '[data-test-id^="bard-mode-option-"]']:
+        items = page.locator(selector)
+        visible = [item for item in await items.all() if await item.is_visible()]
+        if visible:
+            return visible
+    await page.keyboard.press("Escape")
+    raise HTTPException(502, "Gemini 웹 모드 메뉴를 읽지 못했습니다.")
+
+
+async def discover_modes(page):
+    choices = {}
+    try:
+        for item in await mode_items(page):
+            if not await item.is_enabled() or await item.get_attribute("aria-disabled") == "true":
+                continue
+            lines = [line.strip() for line in (await item.inner_text()).splitlines() if line.strip()]
+            if not lines:
+                continue
+            label = lines[0]
+            web_id = await item.get_attribute("data-mode-id")
+            identity = mode_id(label, web_id)
+            choices[identity] = {"id": identity, "name": "Gemini Web · " + label, "web_label": label, "web_id": web_id}
+    finally:
+        await page.keyboard.press("Escape")
+    if not choices:
+        raise HTTPException(502, "계정에서 선택할 수 있는 Gemini 웹 모드를 찾지 못했습니다.")
+    return choices
+
+
+async def choose_mode(page, model):
+    if model == MODEL_ID:
+        return
+    if model not in model_choices:
+        model_choices.update(await discover_modes(page))
+    choice = model_choices.get(model)
+    if choice is None:
+        raise HTTPException(404, "사용할 수 없는 Gemini 웹 모드입니다. 목록을 새로 고쳐 주세요.")
+    for item in await mode_items(page):
+        lines = [line.strip() for line in (await item.inner_text()).splitlines() if line.strip()]
+        if lines and (await item.get_attribute("data-mode-id") == choice.get("web_id") if choice.get("web_id") else lines[0] == choice["web_label"]) and await item.is_enabled():
+            await item.click()
+            await page.wait_for_timeout(300)
+            # The picker button may abbreviate its label (e.g. "Flash" for
+            # "3.8 Flash"). Verify the stable web identity in the menu instead.
+            for attempt in range(10):
+                confirmed = False
+                for current in await mode_items(page):
+                    if choice.get("web_id") and await current.get_attribute("data-mode-id") == choice["web_id"]:
+                        confirmed = ("selected" in (await current.get_attribute("class") or "").split()
+                                     or await current.get_attribute("aria-checked") == "true")
+                    elif not choice.get("web_id"):
+                        selected = await page.locator('.model-picker-container button').first.inner_text()
+                        confirmed = choice["web_label"] in selected
+                    if confirmed:
+                        break
+                await page.keyboard.press("Escape")
+                if confirmed:
+                    return
+                await page.wait_for_timeout(200)
+            raise HTTPException(502, "Gemini 웹 모드 전환을 확인하지 못했습니다.")
+    await page.keyboard.press("Escape")
+    raise HTTPException(409, "선택한 Gemini 웹 모드가 현재 계정 메뉴에 없습니다.")
 
 
 async def get_or_create_session_page(session_id: str, start_new_chat: bool = False) -> Page:
@@ -273,6 +355,10 @@ async def send_to_gemini(page: Page, text: str, timeout: Optional[int] = None) -
             # Do not mistake a pause in a long answer for generation completion.
             generating = await page.locator('button[aria-label*="Stop"], button[aria-label*="중지"], button.stop-button').first.is_visible()
             if answer.strip() and not generating and time.monotonic() - stable_since >= 3:
+                # Preserve inline JSON before Markdown conversion can escape
+                # underscores and brackets in tool names or arguments.
+                if parse_tool_calls(answer):
+                    return answer.strip()
                 # Gemini renders JSON in code widgets; toolbar text must not
                 # become part of a tool argument envelope.
                 for block in await responses.last.locator('pre code, pre').all():
@@ -280,7 +366,7 @@ async def send_to_gemini(page: Page, text: str, timeout: Optional[int] = None) -
                     if parse_tool_calls(candidate):
                         return candidate.strip()
                 html = await responses.last.inner_html()
-                return md(html, heading_style="ATX").strip()
+                return md(html, heading_style="ATX", escape_underscores=False).strip()
         await asyncio.sleep(0.5)
     raise HTTPException(504, "Gemini browser response timed out")
 
@@ -314,8 +400,8 @@ async def chat_completions(request: ChatRequest):
     if not request.messages:
         raise HTTPException(400, "Messages required")
     
-    if request.model != MODEL_ID:
-        raise HTTPException(404, "Unknown model; use gemini-web")
+    if request.model != MODEL_ID and not request.model.startswith("gemini-web-"):
+        raise HTTPException(404, "Unknown Gemini web model")
     if any(isinstance(m.content, list) and any(c.get("type") != "text" for c in m.content) for m in request.messages):
         raise HTTPException(400, "This browser route supports text input only")
     if request.tool_choice not in (None, "auto", "none"):
@@ -330,6 +416,7 @@ async def chat_completions(request: ChatRequest):
         if request.max_tokens:
             conversation += f"\nKeep the answer within {request.max_tokens} output tokens."
         try:
+            await choose_mode(page, request.model)
             response = await send_to_gemini(page, conversation, request.timeout)
             print("Gemini response received.", flush=True)
             
@@ -484,17 +571,26 @@ async def chat_completions(request: ChatRequest):
 
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "google-web"},
-        ]
-    }
+    if not is_ready:
+        raise HTTPException(503, "Google 로그인 완료 후 웹 모델 목록을 가져올 수 있습니다.")
+    async with request_lock:
+        page = await context.new_page()
+        try:
+            await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
+            choices = await discover_modes(page)
+            model_choices.clear()
+            model_choices.update(choices)
+        finally:
+            await page.close()
+    return {"object": "list", "data": [
+        {"id": MODEL_ID, "name": "Gemini Web · 웹에서 현재 선택한 모드", "object": "model", "owned_by": "google-web"},
+        *[{**choice, "object": "model", "owned_by": "google-web"} for choice in model_choices.values()],
+    ]}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ready" if is_ready else "initializing", "stage": login_stage, "sessions": len(session_pages)}
+    return {"status": "ready" if is_ready else "initializing", "stage": login_stage, "error": login_error, "sessions": len(session_pages)}
 
 
 @app.post("/login/complete")
@@ -537,7 +633,17 @@ async def startup():
     print("  OpenAI-Compatible API for Gemini Web")
     print("="*50)
     global startup_task
-    startup_task = asyncio.create_task(init_browser())
+    async def initialize():
+        global login_stage, login_error, is_ready
+        try:
+            await init_browser()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            is_ready = False
+            login_stage = "error"
+            login_error = "Gemini 브라우저 연결을 완료하지 못했습니다. 로그인 화면에서 다시 시도해 주세요."
+    startup_task = asyncio.create_task(initialize())
 
 
 @app.on_event("shutdown")
