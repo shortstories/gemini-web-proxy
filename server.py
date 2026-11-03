@@ -588,6 +588,48 @@ async def list_models():
     ]}
 
 
+USAGE_CACHE_TTL = 60.0
+_usage_cache = {"at": 0.0, "value": None}
+
+
+@app.get("/v1/usage")
+async def usage(fresh: int = 0):
+    """Read the Gemini Apps usage page in the signed-in browser and return its text.
+
+    The page costs a browser navigation, so the answer is shared for a minute
+    unless the caller asks for `fresh=1`.
+    """
+    now = time.time()
+    if not fresh and _usage_cache["value"] is not None and now - _usage_cache["at"] < USAGE_CACHE_TTL:
+        return _usage_cache["value"]
+    if not is_ready or context is None:
+        raise HTTPException(503, "Google 로그인 완료 후 사용량을 가져올 수 있습니다.")
+    async with request_lock:
+        page = await context.new_page()
+        try:
+            await page.goto("https://gemini.google.com/usage", wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(4000)
+            url = page.url
+            cookies = await page.context.cookies("https://gemini.google.com")
+            account = any(c["name"] in ("SID", "__Secure-1PSID", "__Secure-3PSID") for c in cookies)
+            signed_in = account and url.startswith("https://gemini.google.com/") and "accounts.google.com" not in url
+            title = await page.title()
+            text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        finally:
+            await page.close()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    value = {
+        "signedIn": signed_in,
+        "url": url,
+        "title": title,
+        "lines": lines[:200],
+        "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _usage_cache["at"] = time.time()
+    _usage_cache["value"] = value
+    return value
+
+
 @app.get("/health")
 async def health():
     return {"status": "ready" if is_ready else "initializing", "stage": login_stage, "error": login_error, "sessions": len(session_pages)}
