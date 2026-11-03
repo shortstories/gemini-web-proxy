@@ -130,6 +130,8 @@ Once configured, simply use OpenCode normally. All requests will be routed throu
 - **Free Usage**: No API keys or paid subscriptions required
 - **Tool Calling**: Full support for OpenCode's tool system
 - **Persistent Sessions**: Login once, use indefinitely
+- **Conversation Continuation**: Follow-up turns reuse the same browser tab and send only the new messages
+- **Automatic Recovery**: A dead browser session is relaunched and re-verified instead of failing every request
 - **Local Operation**: Everything runs on your machine
 - **OpenAI Compatible**: Works with any OpenAI-compatible client
 
@@ -151,6 +153,11 @@ python run.py
 2. Check that port 8080 is not in use
 3. Verify your Google account has Gemini access
 4. Try restarting the proxy
+
+`GET /health` shows whether the browser is still connected: `stage` moves to
+`reconnecting` while a dropped Chromium context is relaunched, and to
+`manual-login` when the Google session itself has to be renewed from the
+subscription login page.
 
 ### OpenCode Configuration
 
@@ -185,6 +192,30 @@ OpenCode → HTTP Request → Gemini Proxy → Browser Automation → Gemini Web
 - Chrome profile data persists between runs
 - Login state is maintained automatically
 
+### Conversation Continuation
+
+Harness clients such as DSH resend the whole message history on every turn. The
+proxy identifies the conversation (from `conversation_id`, `sessionId`, or the
+`X-Conversation-Id` header, falling back to a fingerprint of the system prompt
+plus the first user message) and keeps that conversation's tab open:
+
+- The first turn sends the full prompt, including the system instructions, once.
+- Later turns send only the new messages, so earlier turns are never duplicated
+  in the browser history and the tab keeps its own context.
+- If the history diverges (an edited earlier turn, changed tools, a killed tab)
+  the tab is rebuilt and the full history is sent again, so state never leaks
+  between conversations.
+- Idle conversations are closed after `CONVERSATION_TTL` seconds and at most
+  `MAX_PARKED_TABS` tabs are kept.
+- When a rebuilt prompt exceeds `HISTORY_CHAR_BUDGET` characters, older turns
+  are clipped to `CLIP_CHARS` each while the newest `KEEP_RECENT_FULL` messages
+  stay intact.
+
+`GET /health` reports `stage`, the last `error`, and the parked `conversations`.
+A dead Chromium context is detected before each request and relaunched
+automatically; the service only falls back to manual login when the stored
+Google session itself can no longer be verified.
+
 ### Tool Calling
 
 The proxy includes advanced prompt engineering to ensure Gemini properly formats tool calls for OpenCode compatibility.
@@ -195,6 +226,8 @@ The proxy includes advanced prompt engineering to ensure Gemini properly formats
 - Dependent on Gemini web interface stability
 - May need updates if Gemini changes their interface
 - Rate limited by Gemini's web interface limits
+- Each parked conversation holds one browser tab; history compaction is
+  deterministic text clipping, not a rewritten summary
 
 ## Contributing
 
