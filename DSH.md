@@ -80,6 +80,14 @@ closes its tab. A shared lock serializes requests so independent DSH sessions
 cannot share browser context. Gemini Web may retain the created chats in the
 account's own activity history.
 
+`GET /v1/usage` (bearer token, like the rest of the API) opens
+`https://gemini.google.com/usage` in the same signed-in browser and returns the
+page's visible text lines plus `signedIn` (`{"signedIn", "url", "title",
+"lines", "fetchedAt"}`). The answer is shared for 60 seconds; `?fresh=1`
+re-reads the page. It exists so DSH panels can show the account's daily and
+weekly Gemini limits instead of guessing them; the parse itself lives in the
+consumer.
+
 The model id `gemini-web` denotes the web application's currently selected
 mode; it does not promise a particular backend model. Discovered
 `gemini-web-<web-mode-id>` ids explicitly select their corresponding menu entry.
