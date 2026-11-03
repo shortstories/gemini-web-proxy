@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Annotated
 import json
 import asyncio
 import time
@@ -32,12 +32,23 @@ session_pages: Dict[str, Page] = {}
 page_locks: Dict[str, asyncio.Lock] = {}
 session_msg_count: Dict[str, int] = {}
 request_lock = asyncio.Lock()
+reconnect_lock = asyncio.Lock()
 startup_task = None
+cleanup_task = None
 manual_browser = None
 login_stage = "starting"
 login_error = None
 MODEL_ID = "gemini-web"
 model_choices = {}
+
+# Conversation continuation. A parked entry keeps a filled Gemini tab alive so
+# later turns of the same harness conversation only have to send new messages.
+conversations: Dict[str, Dict[str, Any]] = {}
+CONVERSATION_TTL = 1800      # seconds an idle tab stays reusable
+MAX_PARKED_TABS = 6          # hard cap on live conversations
+HISTORY_CHAR_BUDGET = 36000  # a full re-send is compressed beyond this size
+KEEP_RECENT_FULL = 8         # newest messages never clipped by that compression
+CLIP_CHARS = 240             # per-message clip for older turns
 
 @app.middleware("http")
 async def local_auth(request, call_next):
@@ -79,6 +90,9 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
+    user: Optional[str] = None
+    sessionId: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 def get_content_text(content: Any) -> str:
     """Helper to extract text from string or list content"""
@@ -137,28 +151,38 @@ async def init_browser():
             await asyncio.sleep(1)
             INTERACTIVE_REQUEST.unlink(missing_ok=True)
             LOGIN_COMPLETE.unlink(missing_ok=True)
-        context = await playwright_instance.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR), headless=True, channel="chrome",
-            ignore_default_args=["--password-store=basic", "--use-mock-keychain"],
-            args=["--disable-extensions", "--no-first-run", "--disable-dev-shm-usage"],
-            viewport={"width": 1280, "height": 900},
-        )
-        page = await context.new_page()
-        await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(3)
-        if not await check_logged_in(page):
-            LOGIN_FLAG.unlink(missing_ok=True)
-            await context.close()
-            context = None
-            login_stage = "verification-failed"
-            login_error = "저장된 Google 로그인을 확인하지 못했습니다. 자동 재로그인은 중지했습니다."
+        try:
+            await connect_context()
+        except Exception:
             return
-        LOGIN_FLAG.write_text("ok")
-        await page.close()
-        is_ready = True
-        login_stage = "connected"
         print("Gemini web subscription is ready (headless).", flush=True)
         return
+
+
+async def connect_context():
+    """Launch the signed-in profile and verify the stored Google session."""
+    global context, is_ready, login_stage, login_error
+    context = await playwright_instance.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR), headless=True, channel="chrome",
+        ignore_default_args=["--password-store=basic", "--use-mock-keychain"],
+        args=["--disable-extensions", "--no-first-run", "--disable-dev-shm-usage"],
+        viewport={"width": 1280, "height": 900},
+    )
+    page = await context.new_page()
+    await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
+    await asyncio.sleep(3)
+    if not await check_logged_in(page):
+        LOGIN_FLAG.unlink(missing_ok=True)
+        await context.close()
+        context = None
+        login_stage = "verification-failed"
+        login_error = "저장된 Google 로그인을 확인하지 못했습니다. 자동 재로그인은 중지했습니다."
+        raise RuntimeError("stored Google login could not be verified")
+    LOGIN_FLAG.write_text("ok")
+    await page.close()
+    is_ready = True
+    login_stage = "connected"
+    login_error = None
 
 
 def mode_id(label, web_id=None):
@@ -304,38 +328,195 @@ def format_tools_prompt(tools: List[Tool]) -> str:
     )
 
 
-def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = None) -> str:
-    """Format messages into a conversation prompt"""
-    formatted = []
-    
-    # Add tools prompt at the beginning if tools are provided
-    if tools:
-        formatted.append(format_tools_prompt(tools))
-    
-    for msg in messages:
-        role = msg.role
-        content = get_content_text(msg.content)
-        
-        if role in ("system", "developer"):
-            formatted.append(f"System Instructions:\n{content}")
-        elif role == "user":
-            formatted.append(f"User: {content}")
-        elif role == "assistant":
-            if msg.tool_calls:
-                # Format previous tool calls
-                tc_str = json.dumps({"tool_calls": [
-                    {"name": tc.get("function", {}).get("name"), 
-                     "arguments": json.loads(tc.get("function", {}).get("arguments", "{}"))}
-                    for tc in msg.tool_calls
-                ]})
-                formatted.append(f"Assistant: {tc_str}")
-            elif content:
-                formatted.append(f"Assistant: {content}")
-        elif role == "tool":
-            tool_name = msg.name or "tool"
-            formatted.append(f"Tool Result ({tool_name}, call_id={msg.tool_call_id}):\n{content}")
-    
+def _message_line(msg: Message, clip: int = 0) -> Optional[str]:
+    role = msg.role
+    content = get_content_text(msg.content)
+    if clip and role not in ("system", "developer") and len(content) > clip:
+        content = content[:clip] + " …(생략)"
+    if role in ("system", "developer"):
+        return f"System Instructions:\n{content}"
+    if role == "user":
+        return f"User: {content}"
+    if role == "assistant":
+        if msg.tool_calls:
+            # Format previous tool calls
+            tc_str = json.dumps({"tool_calls": [
+                {"name": tc.get("function", {}).get("name"),
+                 "arguments": json.loads(tc.get("function", {}).get("arguments", "{}"))}
+                for tc in msg.tool_calls
+            ]})
+            return f"Assistant: {tc_str}"
+        if content:
+            return f"Assistant: {content}"
+        return None
+    if role == "tool":
+        tool_name = msg.name or "tool"
+        return f"Tool Result ({tool_name}, call_id={msg.tool_call_id}):\n{content}"
+    return None
+
+
+def _render(messages: List[Message], tools: Optional[List[Tool]], clips: Dict[int, int]) -> str:
+    formatted = [format_tools_prompt(tools)] if tools else []
+    for index, msg in enumerate(messages):
+        line = _message_line(msg, clips.get(index, 0))
+        if line:
+            formatted.append(line)
     return "\n\n".join(formatted)
+
+
+def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = None,
+                        budget: Optional[int] = None) -> str:
+    """Format messages into a prompt, compressing older turns when over budget."""
+    prompt = _render(messages, tools, {})
+    if budget is None or len(prompt) <= budget:
+        return prompt
+    recent = max(0, len(messages) - KEEP_RECENT_FULL)
+    clipped = _render(messages, tools, {index: CLIP_CHARS for index in range(recent)})
+    return (
+        "[앞선 대화는 길이 때문에 축약했습니다. 축약 구간의 세부 내용이 필요하면 추측하지 말고 사용자에게 확인하세요.]\n\n"
+        + clipped
+    )
+
+
+def message_key(msg: Message) -> str:
+    return "\x00".join([
+        msg.role or "",
+        msg.name or "",
+        msg.tool_call_id or "",
+        get_content_text(msg.content),
+        json.dumps(msg.tool_calls, sort_keys=True, ensure_ascii=False) if msg.tool_calls else "",
+    ])
+
+
+def tools_key(tools: Optional[List[Tool]]) -> str:
+    if not tools:
+        return ""
+    payload = json.dumps([t.model_dump() for t in tools], sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def conversation_key(request: ChatRequest, header_id: Optional[str]) -> str:
+    """Identify one harness conversation across its successive full-history calls."""
+    explicit = request.conversation_id or request.sessionId or header_id
+    if explicit:
+        return "cid:" + hashlib.sha256(explicit.encode()).hexdigest()[:24]
+    system = next((get_content_text(m.content) for m in request.messages if m.role in ("system", "developer")), "")
+    user = next((get_content_text(m.content) for m in request.messages if m.role == "user"), "")
+    if not (system or user):
+        user = " ".join(get_content_text(m.content) for m in request.messages)
+    return "seed:" + hashlib.sha256((system + "\x00" + user).encode()).hexdigest()[:24]
+
+
+def plan_delta(key: str, request: ChatRequest, tools: Optional[List[Tool]]):
+    """Return (state, new messages) when a parked tab continues this conversation."""
+    state = conversations.get(key)
+    if not state:
+        return None
+    if state["session"] not in session_pages:
+        conversations.pop(key, None)
+        return None
+    if state["tools"] != tools_key(tools):
+        return None
+    consumed = state["consumed"]
+    if len(request.messages) <= consumed:
+        return None
+    if [message_key(m) for m in request.messages[:consumed]] != state["prefix"]:
+        return None
+    # The harness echoes the browser's own answer back to us; it must match.
+    if message_key(request.messages[consumed]) != state["echo"]:
+        return None
+    delta = request.messages[consumed + 1:]
+    if not delta:
+        return None
+    return state, delta
+
+
+def delta_prompt(messages: List[Message], max_tokens: Optional[int] = None) -> str:
+    prompt = (
+        "Continue this same chat. Earlier turns are already here, so do not repeat or summarise them.\n\n"
+        + format_conversation(messages)
+    )
+    if max_tokens:
+        prompt += f"\nKeep the answer within {max_tokens} output tokens."
+    return prompt
+
+
+async def close_session(session_id: str) -> None:
+    page = session_pages.pop(session_id, None)
+    page_locks.pop(session_id, None)
+    if page is not None:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def evict_conversations() -> None:
+    """Close idle or evicted conversation tabs so the browser stays small."""
+    stale = [
+        key for key, state in list(conversations.items())
+        if state["session"] not in session_pages
+        or time.monotonic() - state["touched"] > CONVERSATION_TTL
+    ]
+    for key in stale:
+        session_id = conversations.pop(key, {}).get("session")
+        if session_id:
+            await close_session(session_id)
+    while len(conversations) > MAX_PARKED_TABS:
+        oldest = min(conversations, key=lambda item: conversations[item]["touched"])
+        await close_session(conversations.pop(oldest)["session"])
+
+
+async def browser_alive() -> bool:
+    if context is None:
+        return False
+    try:
+        await asyncio.wait_for(context.cookies("https://gemini.google.com"), timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+async def stop_browser() -> None:
+    global context, is_ready
+    conversations.clear()
+    for session_id in list(session_pages):
+        await close_session(session_id)
+    if context is not None:
+        try:
+            await context.close()
+        except Exception:
+            pass
+        context = None
+    is_ready = False
+
+
+async def ensure_ready() -> None:
+    """Reconnect a dead browser session instead of failing every later request."""
+    global is_ready, login_stage, login_error, playwright_instance
+    if is_ready and await browser_alive():
+        return
+    if startup_task is not None and not startup_task.done():
+        raise HTTPException(503, "Service initializing...")
+    async with reconnect_lock:
+        if is_ready and await browser_alive():
+            return
+        await stop_browser()
+        if playwright_instance is None:
+            playwright_instance = await async_playwright().start()
+        if not LOGIN_FLAG.exists():
+            login_stage = "manual-login"
+            login_error = "Google 로그인이 만료되었습니다. 로그인 화면에서 다시 인증해 주세요."
+            raise HTTPException(503, login_error)
+        login_stage = "reconnecting"
+        login_error = None
+        print("Reconnecting the Gemini browser…", flush=True)
+        try:
+            await connect_context()
+        except Exception:
+            login_stage = "error"
+            login_error = "Gemini 브라우저 자동 복구에 실패했습니다. 잠시 후 다시 시도해 주세요."
+            raise HTTPException(503, login_error)
 
 
 async def send_to_gemini(page: Page, text: str, timeout: Optional[int] = None) -> str:
@@ -393,10 +574,10 @@ def parse_tool_calls(response: str) -> Optional[List[Dict]]:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
-    if not is_ready:
-        raise HTTPException(503, "Service initializing...")
-    
+async def chat_completions(
+    request: ChatRequest,
+    x_conversation_id: Annotated[Optional[str], Header(alias="X-Conversation-Id")] = None,
+):
     if not request.messages:
         raise HTTPException(400, "Messages required")
     
@@ -407,16 +588,31 @@ async def chat_completions(request: ChatRequest):
     if request.tool_choice not in (None, "auto", "none"):
         raise HTTPException(400, "Forced tool choice is not supported")
     tools = request.tools if request.tool_choice != "none" else None
-    # Each call supplies the full harness history. A fresh tab avoids mixing
-    # independent DSH sessions or duplicating earlier turns in browser history.
+    # The harness resends the full history each turn. Reuse the parked tab and
+    # send only the new messages; rebuild from scratch whenever anything diverges.
+    key = conversation_key(request, x_conversation_id)
     async with request_lock:
-        session_id = uuid.uuid4().hex
-        page = await get_or_create_session_page(session_id)
-        conversation = format_conversation(request.messages, tools)
-        if request.max_tokens:
-            conversation += f"\nKeep the answer within {request.max_tokens} output tokens."
+        await ensure_ready()
+        await evict_conversations()
+        resumed = plan_delta(key, request, tools)
+        if resumed:
+            state, delta = resumed
+            session_id = state["session"]
+            page = session_pages[session_id]
+            conversation = delta_prompt(delta, request.max_tokens)
+        else:
+            previous = conversations.pop(key, None)
+            if previous:
+                await close_session(previous["session"])
+            state = None
+            session_id = uuid.uuid4().hex
+            page = await get_or_create_session_page(session_id)
+            conversation = format_conversation(request.messages, tools, budget=HISTORY_CHAR_BUDGET)
+            if request.max_tokens:
+                conversation += f"\nKeep the answer within {request.max_tokens} output tokens."
         try:
-            await choose_mode(page, request.model)
+            if state is None or state.get("model") != request.model:
+                await choose_mode(page, request.model)
             response = await send_to_gemini(page, conversation, request.timeout)
             print("Gemini response received.", flush=True)
             
@@ -449,6 +645,16 @@ async def chat_completions(request: ChatRequest):
                 msg["content"] = None
             else:
                 msg["content"] = response
+            
+            conversations[key] = {
+                "session": session_id,
+                "prefix": [message_key(m) for m in request.messages],
+                "consumed": len(request.messages),
+                "echo": message_key(Message(**msg)),
+                "tools": tools_key(tools),
+                "model": request.model,
+                "touched": time.monotonic(),
+            }
             
             result = {
                 "id": f"chatcmpl-{int(time.time())}",
@@ -562,18 +768,22 @@ async def chat_completions(request: ChatRequest):
             return result
             
         except HTTPException:
+            conversations.pop(key, None)
+            await close_session(session_id)
             raise
         except Exception:
+            conversations.pop(key, None)
+            await close_session(session_id)
+            if not await browser_alive():
+                await stop_browser()
+                raise HTTPException(503, "Gemini 브라우저 연결이 끊겨 자동 복구를 시작했습니다. 잠시 후 다시 시도해 주세요.")
             raise HTTPException(502, "Gemini browser request failed; check the subscription login page")
-        finally:
-            await delete_session(session_id)
 
 
 @app.get("/v1/models")
 async def list_models():
-    if not is_ready:
-        raise HTTPException(503, "Google 로그인 완료 후 웹 모델 목록을 가져올 수 있습니다.")
     async with request_lock:
+        await ensure_ready()
         page = await context.new_page()
         try:
             await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
@@ -588,9 +798,22 @@ async def list_models():
     ]}
 
 
+USAGE_CACHE_TTL = 60.0
+_usage_cache = {"at": 0.0, "value": None}
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ready" if is_ready else "initializing", "stage": login_stage, "error": login_error, "sessions": len(session_pages)}
+    return {
+        "status": "ready" if is_ready else "initializing",
+        "stage": login_stage,
+        "error": login_error,
+        "sessions": len(session_pages),
+        "conversations": [
+            {"session": state["session"], "messages": state["consumed"]}
+            for state in conversations.values()
+        ],
+    }
 
 
 @app.post("/login/complete")
@@ -610,13 +833,10 @@ async def reset():
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str):
     if session_id in session_pages:
-        try:
-            await session_pages[session_id].close()
-        except:
-            pass
-        del session_pages[session_id]
-        if session_id in page_locks:
-            del page_locks[session_id]
+        for key, state in list(conversations.items()):
+            if state["session"] == session_id:
+                conversations.pop(key, None)
+        await close_session(session_id)
         return {"status": "deleted", "session_id": session_id}
     raise HTTPException(404, "Session not found")
 
@@ -632,7 +852,7 @@ async def startup():
     print("  00BX GEMINI API SERVICE")
     print("  OpenAI-Compatible API for Gemini Web")
     print("="*50)
-    global startup_task
+    global startup_task, cleanup_task
     async def initialize():
         global login_stage, login_error, is_ready
         try:
@@ -645,10 +865,29 @@ async def startup():
             login_error = "Gemini 브라우저 연결을 완료하지 못했습니다. 로그인 화면에서 다시 시도해 주세요."
     startup_task = asyncio.create_task(initialize())
 
+    async def janitor():
+        while True:
+            await asyncio.sleep(60)
+            if request_lock.locked():
+                continue
+            async with request_lock:
+                try:
+                    await evict_conversations()
+                except Exception:
+                    pass
+    cleanup_task = asyncio.create_task(janitor())
+
 
 @app.on_event("shutdown")
 async def shutdown():
-    global context, playwright_instance, manual_browser
+    global context, playwright_instance, manual_browser, cleanup_task
+    if cleanup_task and not cleanup_task.done():
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+    conversations.clear()
     if manual_browser and manual_browser.returncode is None:
         manual_browser.terminate()
         await manual_browser.wait()
