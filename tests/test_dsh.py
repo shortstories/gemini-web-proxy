@@ -175,6 +175,91 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             await server.ensure_ready()
         stop.assert_awaited_once()
         connect.assert_awaited_once()
+    async def test_forced_tool_choice_becomes_a_prompt_instruction(self):
+        request = server.ChatRequest(
+            model='gemini-web',
+            tools=[{'type': 'function', 'function': {'name': 'exec', 'parameters': {'type': 'object'}}}],
+            tool_choice='required',
+            max_completion_tokens=120,
+            messages=[{'role': 'user', 'content': 'run it'}],
+        )
+        sent = []
+
+        async def fake_send(page, text, timeout=None):
+            sent.append(text)
+            return '{"tool_calls":[{"name":"exec","arguments":{"cmd":"id"}}]}'
+
+        pages = []
+        with patch.object(server, 'ensure_ready', new=AsyncMock()), \
+             patch.object(server, 'get_or_create_session_page', side_effect=install_sessions(pages)), \
+             patch.object(server, 'send_to_gemini', side_effect=fake_send):
+            response = await server.chat_completions(request)
+
+        self.assertEqual(response['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertIn(server.FORCED_TOOL_INSTRUCTION, sent[0])
+        self.assertIn('within 120 output tokens', sent[0])
+
+    async def test_tool_choice_none_sends_no_tool_definitions(self):
+        request = server.ChatRequest(
+            model='gemini-web',
+            tools=[{'type': 'function', 'function': {'name': 'exec', 'parameters': {'type': 'object'}}}],
+            tool_choice='none',
+            messages=[{'role': 'user', 'content': 'just answer'}],
+        )
+        sent = []
+
+        async def fake_send(page, text, timeout=None):
+            sent.append(text)
+            return 'plain answer'
+
+        pages = []
+        with patch.object(server, 'ensure_ready', new=AsyncMock()), \
+             patch.object(server, 'get_or_create_session_page', side_effect=install_sessions(pages)), \
+             patch.object(server, 'send_to_gemini', side_effect=fake_send):
+            response = await server.chat_completions(request)
+
+        self.assertEqual(response['choices'][0]['finish_reason'], 'stop')
+        self.assertNotIn('Available tools:', sent[0])
+        self.assertIn('Do not call any tool this turn', sent[0])
+
+    async def test_forced_choice_for_undeclared_tool_fails_before_dispatch(self):
+        request = server.ChatRequest(
+            model='gemini-web',
+            tools=[{'type': 'function', 'function': {'name': 'exec'}}],
+            tool_choice={'type': 'function', 'function': {'name': 'missing'}},
+            messages=[{'role': 'user', 'content': 'x'}],
+        )
+        with patch.object(server, 'ensure_ready', new=AsyncMock()) as ready, \
+             patch.object(server, 'get_or_create_session_page', new=AsyncMock()) as page:
+            with self.assertRaises(server.HTTPException) as caught:
+                await server.chat_completions(request)
+        self.assertEqual(caught.exception.status_code, 400)
+        page.assert_not_awaited()
+        ready.assert_not_awaited()
+
+    async def test_streaming_usage_chunk_only_when_requested(self):
+        async def collect(request):
+            pages = []
+            with patch.object(server, 'ensure_ready', new=AsyncMock()), \
+                 patch.object(server, 'get_or_create_session_page', side_effect=install_sessions(pages)), \
+                 patch.object(server, 'send_to_gemini', new=AsyncMock(return_value='hi there')):
+                response = await server.chat_completions(request)
+                events = ''.join([chunk async for chunk in response.body_iterator])
+            return [json.loads(line[6:]) for line in events.splitlines() if line.startswith('data: ') and '[DONE]' not in line]
+
+        with_usage = await collect(server.ChatRequest(
+            model='gemini-web', stream=True, stream_options={'include_usage': True},
+            messages=[{'role': 'user', 'content': 'hello'}],
+        ))
+        self.assertEqual(with_usage[-1]['choices'], [])
+        self.assertGreater(with_usage[-1]['usage']['total_tokens'], 0)
+        self.assertEqual(with_usage[-2]['choices'][0]['finish_reason'], 'stop')
+
+        without_usage = await collect(server.ChatRequest(
+            model='gemini-web', stream=True, messages=[{'role': 'user', 'content': 'hello'}],
+        ))
+        self.assertTrue(all(chunk['choices'] for chunk in without_usage))
+        self.assertTrue(all('usage' not in chunk for chunk in without_usage))
 
 
 if __name__ == '__main__':

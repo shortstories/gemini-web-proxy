@@ -75,10 +75,19 @@ Login uses display :99. The API binds 127.0.0.1:18089, VNC binds loopback port
 
 ## Bridge behavior and limits
 
-Each request sends the full DSH history into a new Gemini browser chat, then
-closes its tab. A shared lock serializes requests so independent DSH sessions
-cannot share browser context. Gemini Web may retain the created chats in the
-account's own activity history.
+DSH resends the whole message history on every turn. The bridge identifies the
+conversation (`conversation_id`, `sessionId`, or the `X-Conversation-Id` header,
+falling back to a fingerprint of the system prompt and first user message) and
+keeps that conversation's Gemini chat open: the first turn sends the full
+prompt, later turns send only the new messages, so earlier turns are neither
+duplicated in the browser nor lost from its context. A tab is rebuilt and the
+full history is resent whenever the history diverges, the declared tools change,
+or the browser died; long rebuilt prompts clip older turns to a fixed budget
+while the newest turns stay verbatim. Parked conversations close after
+`CONVERSATION_TTL` seconds or when more than `MAX_PARKED_TABS` exist. A shared
+lock still serializes requests so independent DSH sessions never interleave
+inside the browser. Gemini Web may retain the created chats in the account's
+own activity history.
 
 The model id `gemini-web` denotes the web application's currently selected
 mode; it does not promise a particular backend model. Discovered
@@ -91,11 +100,20 @@ does not offer native function-calling guarantees. Browser UI changes can
 require selector updates.
 
 Streaming is buffered: SSE chunks are emitted after the browser completes.
-Usage is estimated from character counts. Output limits are prompt guidance,
-not a provider-enforced token cap. The 32K context configuration is a
-conservative local admission setting, not a verified Google account limit.
-Forced tool choice and image input fail explicitly. The bridge does not return
-reasoning or provider thought signatures.
+Usage is estimated from character counts and included as a final chunk when the
+client asks for `stream_options.include_usage`, the way the OpenAI SDK does.
+`max_tokens` and `max_completion_tokens` are prompt guidance, not a
+provider-enforced token cap. The 32K context configuration is a conservative
+local admission setting, not a verified Google account limit.
+Forced tool choice (`required`, `any`, or a named function) becomes an
+instruction inside the prompt instead of a rejected request, while image input
+fails explicitly. The bridge does not return reasoning or provider thought
+signatures.
+
+`GET /health` reports `stage` (`connected`, `reconnecting`, `manual-login`),
+the last error, and the parked conversations. A dropped Chromium context is
+relaunched and re-verified before the request is served; only an expired Google
+session falls back to the manual login flow.
 
 ## Validation
 
@@ -106,7 +124,8 @@ node --test dsh/host.test.cjs
 node tests/login-ui.mjs
 ```
 
-Tests cover isolation between requests, tool-call SSE serialization, nested
-JSON arguments, undeclared tools, image rejection, callback destination checks,
-and cross-origin callback rejection. Real Google/OpenAI login and inference
-remain separate live checks.
+Tests cover tab reuse between turns, rebuilt tabs on divergence, history
+compaction, dead-browser recovery, tool-call SSE serialization, usage chunks,
+nested JSON arguments, undeclared tools, forced tool choice, image rejection,
+callback destination checks, and cross-origin callback rejection. Real
+Google/OpenAI login and inference remain separate live checks.

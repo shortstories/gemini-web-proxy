@@ -89,6 +89,8 @@ class ChatRequest(BaseModel):
     tool_choice: Optional[Any] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    stream_options: Optional[Dict[str, Any]] = None
     top_p: Optional[float] = None
     user: Optional[str] = None
     sessionId: Optional[str] = None
@@ -431,14 +433,46 @@ def plan_delta(key: str, request: ChatRequest, tools: Optional[List[Tool]]):
     return state, delta
 
 
-def delta_prompt(messages: List[Message], max_tokens: Optional[int] = None) -> str:
+def delta_prompt(messages: List[Message], max_tokens: Optional[int] = None, hint: Optional[str] = None) -> str:
     prompt = (
         "Continue this same chat. Earlier turns are already here, so do not repeat or summarise them.\n\n"
         + format_conversation(messages)
     )
+    if hint:
+        prompt += f"\n\n{hint}"
     if max_tokens:
         prompt += f"\nKeep the answer within {max_tokens} output tokens."
     return prompt
+
+
+FORCED_TOOL_INSTRUCTION = (
+    "This turn requires a tool call. Reply with exactly one tool-call envelope for the most "
+    "appropriate declared tool, and no additional prose."
+)
+
+
+def tool_choice_plan(choice: Any, tools: Optional[List[Tool]]):
+    """Resolve an OpenAI tool_choice into advertised tools and a turn instruction.
+
+    The browser chat has no native function calling, so a forced choice becomes an
+    instruction inside the prompt instead of a rejected request.
+    """
+    if choice is None or choice == "auto":
+        return tools, None
+    if choice == "none":
+        return None, "Do not call any tool this turn. Answer with plain text only."
+    if choice in ("required", "any"):
+        if not tools:
+            raise HTTPException(400, "tool_choice requires declared tools")
+        return tools, FORCED_TOOL_INSTRUCTION
+    if isinstance(choice, dict):
+        name = (choice.get("function") or {}).get("name") or choice.get("name")
+        if not name:
+            raise HTTPException(400, "Unsupported tool_choice value")
+        if not tools or name not in {t.function.name for t in tools}:
+            raise HTTPException(400, f"tool_choice names the undeclared tool '{name}'")
+        return tools, f"This turn must call the tool '{name}' exactly once and nothing else."
+    raise HTTPException(400, "Unsupported tool_choice value")
 
 
 async def close_session(session_id: str) -> None:
@@ -585,21 +619,21 @@ async def chat_completions(
         raise HTTPException(404, "Unknown Gemini web model")
     if any(isinstance(m.content, list) and any(c.get("type") != "text" for c in m.content) for m in request.messages):
         raise HTTPException(400, "This browser route supports text input only")
-    if request.tool_choice not in (None, "auto", "none"):
-        raise HTTPException(400, "Forced tool choice is not supported")
-    tools = request.tools if request.tool_choice != "none" else None
+    declared_tools = request.tools or None
+    tools, tool_hint = tool_choice_plan(request.tool_choice, declared_tools)
+    max_output_tokens = request.max_tokens or request.max_completion_tokens
     # The harness resends the full history each turn. Reuse the parked tab and
     # send only the new messages; rebuild from scratch whenever anything diverges.
     key = conversation_key(request, x_conversation_id)
     async with request_lock:
         await ensure_ready()
         await evict_conversations()
-        resumed = plan_delta(key, request, tools)
+        resumed = plan_delta(key, request, declared_tools)
         if resumed:
             state, delta = resumed
             session_id = state["session"]
             page = session_pages[session_id]
-            conversation = delta_prompt(delta, request.max_tokens)
+            conversation = delta_prompt(delta, max_output_tokens, tool_hint)
         else:
             previous = conversations.pop(key, None)
             if previous:
@@ -608,8 +642,10 @@ async def chat_completions(
             session_id = uuid.uuid4().hex
             page = await get_or_create_session_page(session_id)
             conversation = format_conversation(request.messages, tools, budget=HISTORY_CHAR_BUDGET)
-            if request.max_tokens:
-                conversation += f"\nKeep the answer within {request.max_tokens} output tokens."
+            if tool_hint:
+                conversation += f"\n\n{tool_hint}"
+            if max_output_tokens:
+                conversation += f"\nKeep the answer within {max_output_tokens} output tokens."
         try:
             if state is None or state.get("model") != request.model:
                 await choose_mode(page, request.model)
@@ -651,7 +687,7 @@ async def chat_completions(
                 "prefix": [message_key(m) for m in request.messages],
                 "consumed": len(request.messages),
                 "echo": message_key(Message(**msg)),
-                "tools": tools_key(tools),
+                "tools": tools_key(declared_tools),
                 "model": request.model,
                 "touched": time.monotonic(),
             }
@@ -674,6 +710,7 @@ async def chat_completions(
             }
             
             # Handle streaming
+            include_usage = bool((request.stream_options or {}).get("include_usage"))
             if request.stream:
                 async def generate():
                     chunk_id = result["id"]
@@ -761,6 +798,16 @@ async def chat_completions(
                         }]
                     }
                     yield f"data: {json.dumps(done_chunk)}\n\n"
+                    if include_usage:
+                        usage_chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": result["usage"],
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                 
                 return StreamingResponse(generate(), media_type="text/event-stream")
